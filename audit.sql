@@ -38,7 +38,7 @@ AS $function$
     END
 $function$;
 
-
+DROP OPERATOR IF EXISTS - (jsonb, text[]);
 CREATE OPERATOR - (
   LEFTARG = jsonb,
   RIGHTARG = text[],
@@ -81,7 +81,7 @@ AS $$
 
 $$ LANGUAGE SQL;
 
-
+DROP OPERATOR IF EXISTS - (jsonb, jsonb);
 CREATE OPERATOR - (
   LEFTARG = jsonb,
   RIGHTARG = jsonb,
