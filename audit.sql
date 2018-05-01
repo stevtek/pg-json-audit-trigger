@@ -175,8 +175,8 @@ BEGIN
         statement_timestamp(),                        -- action_tstamp_stm
         clock_timestamp(),                            -- action_tstamp_clk
         txid_current(),                               -- transaction ID
-        current_setting('application.name'),          -- client application
-        current_setting('application.user'),          -- client user
+        current_setting('application.name', 't'),          -- client application
+        current_setting('application.user', 't'),          -- client user
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
