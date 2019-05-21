@@ -5,8 +5,8 @@
 --
 --    https://github.com/2ndQuadrant/audit-trigger
 --
--- but has been modified to use JSONB insead of HSTORE
---
+-- but has been modified to use JSONB instead of HSTORE
+-- and a row_key has been added to the log, for a key back to the audited table row
 
 --
 -- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
@@ -114,6 +114,7 @@ CREATE TABLE audit.log (
     id bigserial NOT NULL PRIMARY KEY,
     schema_name text NOT NULL,
     table_name text NOT NULL,
+    row_key text,
     relid oid NOT NULL,
     "session_user" text NOT NULL,
     action_tstamp_tx TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -138,6 +139,7 @@ COMMENT ON COLUMN audit.log.id IS 'Unique identifier for each auditable event';
 COMMENT ON COLUMN audit.log.schema_name IS 'Database schema audited table for this event is in';
 COMMENT ON COLUMN audit.log.table_name IS 'Non-schema-qualified table name of table event occured in';
 COMMENT ON COLUMN audit.log.relid IS 'Table OID. Changes with drop/create. Get with ''tablename''::regclass';
+COMMENT ON COLUMN audit.log.row_key IS 'Key for the row in the audited table, by default, this is the value from the ''id'' column converted to text';
 COMMENT ON COLUMN audit.log.session_user IS 'Login / session user whose statement caused the audited event';
 COMMENT ON COLUMN audit.log.action_tstamp_tx IS 'Transaction start timestamp for tx in which audited event occurred';
 COMMENT ON COLUMN audit.log.action_tstamp_stm IS 'Statement start timestamp for tx in which audited event occurred';
@@ -155,11 +157,17 @@ COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an F
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
+CREATE INDEX log_table_name_row_key_action_tstamp_tx_idx
+    ON audit.log (table_name, row_key, action_tstamp_tx DESC);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
     audit_row audit.log;
     excluded_cols text[] = ARRAY[]::text[];
+    row_key_col text = 'id';
+    jsonb_old JSONB;
+    jsonb_new JSONB;
+
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
@@ -169,6 +177,7 @@ BEGIN
         nextval('audit.log_id_seq'),                  -- log ID
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
+        NULL,                                         -- the 'id' column from the NEW row (if it exists)
         TG_RELID,                                     -- relation OID for much quicker searches
         session_user::text,                           -- session_user
         current_timestamp,                            -- action_tstamp_tx
@@ -194,17 +203,34 @@ BEGIN
         excluded_cols = TG_ARGV[1]::text[];
     END IF;
 
+    IF TG_ARGV[2] IS NOT NULL THEN
+        row_key_col = TG_ARGV[2]::text;
+    END IF;
+
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(OLD.*) - excluded_cols;
-        audit_row.diff = (to_jsonb(NEW.*) - audit_row.original) - excluded_cols;
+        jsonb_new = to_jsonb(NEW.*);
+        jsonb_old = to_jsonb(OLD.*);
+        IF jsonb_new ? row_key_col THEN
+            audit_row.row_key = jsonb_new ->> row_key_col;
+        END IF;
+        audit_row.original = jsonb_old - excluded_cols;
+        audit_row.diff = (jsonb_new - audit_row.original) - excluded_cols;
         IF audit_row.diff = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(OLD.*) - excluded_cols;
+        jsonb_old = to_jsonb(OLD.*);
+        IF jsonb_old ? row_key_col THEN
+            audit_row.row_key = jsonb_old ->> row_key_col;
+        END IF;
+        audit_row.original = jsonb_old - excluded_cols;
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-        audit_row.original = to_jsonb(NEW.*) - excluded_cols;
+        jsonb_new = to_jsonb(NEW.*);
+        IF jsonb_new ? row_key_col THEN
+            audit_row.row_key = jsonb_new ->> row_key_col;
+        END IF;
+        audit_row.original = jsonb_new - excluded_cols;
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
@@ -242,6 +268,8 @@ param 1: text[], columns to ignore in updates. Default [].
          that do not exist in the target table. This lets you specify
          a standard set of ignored columns.
 
+param 2: text, row_key_col, the column name for the row identifier in the target table
+
 There is no parameter to disable logging of values. Add this trigger as
 a 'FOR EACH STATEMENT' rather than 'FOR EACH ROW' trigger if you do not
 want to log row values.
@@ -255,25 +283,30 @@ CREATE OR REPLACE FUNCTION audit.audit_table(
   target_table regclass,
   audit_rows boolean,
   audit_query_text boolean,
-  ignored_cols text[]
+  ignored_cols text[],
+  row_key_col text
 )
 RETURNS void AS $body$
 DECLARE
   stm_targets text = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
   _q_txt text;
   _ignored_cols_snip text = '';
+  _row_key_col_snip text = '';
 BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table::TEXT;
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table::TEXT;
 
     IF audit_rows THEN
-        IF array_length(ignored_cols,1) > 0 THEN
+        IF (array_length(ignored_cols,1) > 0 OR row_key_col IS NOT NULL) THEN
             _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
+        END IF;
+        IF row_key_col IS NOT NULL THEN
+            _row_key_col_snip = ', ' || quote_literal(row_key_col);
         END IF;
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' ||
                  target_table::TEXT ||
                  ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
-                 quote_literal(audit_query_text) || _ignored_cols_snip || ');';
+                 quote_literal(audit_query_text) || _ignored_cols_snip || _row_key_col_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
         stm_targets = 'TRUNCATE';
@@ -291,7 +324,7 @@ END;
 $body$
 language 'plpgsql';
 
-COMMENT ON FUNCTION audit.audit_table(regclass, boolean, boolean, text[]) IS $body$
+COMMENT ON FUNCTION audit.audit_table(regclass, boolean, boolean, text[], text) IS $body$
 Add auditing support to a table.
 
 Arguments:
@@ -299,18 +332,25 @@ Arguments:
    audit_rows:       Record each row change, or only audit at a statement level
    audit_query_text: Record the text of the client query that triggered the audit event?
    ignored_cols:     Columns to exclude from update diffs, ignore updates that change only ignored cols.
+   row_key_col:      Column used to identify a row in the target_table.
 $body$;
 
--- Pg doesn't allow variadic calls with 0 params, so provide a wrapper
+-- Pg doesn't allow variadic calls with 0 params, so provide a wrapper for audit_table(target_table, audit_rows, audit_query_text)
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean) RETURNS void AS $body$
-SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[]);
+SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[], NULL);
 $body$ LANGUAGE SQL;
 
 -- And provide a convenience call wrapper for the simplest case
--- of row-level logging with no excluded cols and query logging enabled.
+-- of row-level logging with no excluded cols, query logging enabled, and no row key specified.
 --
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass) RETURNS void AS $body$
-SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't');
+SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::text[], NULL);
+$body$ LANGUAGE 'sql';
+
+-- And provide a convenience call wrapper for case like the simplest, but with a row_key_col specified
+--
+CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, row_key_col text) RETURNS void AS $body$
+SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't', ARRAY[]::text[], $2);
 $body$ LANGUAGE 'sql';
 
 COMMENT ON FUNCTION audit.audit_table(regclass) IS $body$
