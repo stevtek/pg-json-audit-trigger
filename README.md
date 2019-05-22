@@ -23,7 +23,7 @@ Requires PostgreSQL 9.5+
 * the source column is configurable and defaults to 'id'
     * if the column is not found, the row_key is just set to NULL
 * audit_table functions have been changed for setting of the row_key source column name
-* an index on (table_name, row_key, action_tstamp_tx DESC) has been added to the log table
+* an index on (schema_name, table_name, row_key, action_tstamp_tx DESC) has been added to the log table
  for queries to find recent changes for a given row of a given table
 
 
