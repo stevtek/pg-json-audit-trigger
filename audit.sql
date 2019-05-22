@@ -157,8 +157,8 @@ COMMENT ON COLUMN audit.log.statement_only IS '''t'' if audit event is from an F
 CREATE INDEX log_relid_idx ON audit.log(relid);
 CREATE INDEX log_action_tstamp_tx_stm_idx ON audit.log(action_tstamp_stm);
 CREATE INDEX log_action_idx ON audit.log(action);
-CREATE INDEX log_table_name_row_key_action_tstamp_tx_idx
-    ON audit.log (table_name, row_key, action_tstamp_tx DESC);
+CREATE INDEX log_schema_name_table_name_row_key_action_tstamp_tx_idx
+    ON audit.log (schema_name, table_name, row_key, action_tstamp_tx DESC);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
