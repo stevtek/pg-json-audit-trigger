@@ -1,3 +1,7 @@
+--
+-- Forked from
+--    https://github.com/tekells-usgs/pg-json-audit-trigger
+--
 -- An audit history is important on most tables. Provide an audit trigger that logs to
 -- a dedicated audit table for the major relations.
 --
@@ -9,14 +13,15 @@
 -- and a row_key has been added to the log, for a key back to the audited table row
 
 --
--- Implments "JSONB - keys[]", returns a JSONB document with the keys removed
---
---    http://schinckel.net/2014/09/29/adding-json%28b%29-operators-to-postgresql/
+CREATE SCHEMA audit;
+REVOKE ALL ON SCHEMA audit FROM public;
+COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
+
 
 -- param 0: JSONB, source JSONB document to remove keys from
 -- param 1: text[], keys to remove from the JSONB document
 --
-CREATE OR REPLACE FUNCTION "jsonb_minus"(
+CREATE OR REPLACE FUNCTION audit."jsonb_minus"(
   "json" jsonb,
   "keys" TEXT[]
 )
@@ -26,38 +31,25 @@ CREATE OR REPLACE FUNCTION "jsonb_minus"(
   STRICT
 AS $function$
   SELECT
-    -- Only executes opration if the JSON document has the keys
-    CASE WHEN "json" ?| "keys"
+    -- Only executes operation if the JSON document has the keys
+    CASE WHEN jsonb_exists_any("json", "keys")
       THEN COALESCE(
           (SELECT ('{' || string_agg(to_json("key")::text || ':' || "value", ',') || '}')
            FROM jsonb_each("json")
-           WHERE "key" <> ALL ("keys")),
+           WHERE "key" != ALL ("keys")),
           '{}'
         )::jsonb
       ELSE "json"
     END
 $function$;
 
-DROP OPERATOR IF EXISTS - (jsonb, text[]);
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = text[],
-  PROCEDURE = jsonb_minus
-);
-
-
---
--- Implments "JSONB - JSONB", returns a recursive diff of the JSON documents
---
--- http://coussej.github.io/2016/05/24/A-Minus-Operator-For-PostgreSQLs-JSONB/
 --
 -- param 0: JSONB, primary JSONB source document to compare
 -- param 1: JSONB, secondary JSONB source document to compare
 --
-CREATE OR REPLACE FUNCTION jsonb_minus ( arg1 jsonb, arg2 jsonb )
+CREATE OR REPLACE FUNCTION audit.jsonb_minus ( arg1 jsonb, arg2 jsonb )
 RETURNS jsonb
-AS $$
-
+AS $function$
   SELECT
     COALESCE(
       json_object_agg(
@@ -66,7 +58,7 @@ AS $$
           -- if the value is an object and the value of the second argument is
           -- not null, we do a recursion
           WHEN jsonb_typeof(value) = 'object' AND arg2 -> key IS NOT NULL
-          THEN jsonb_minus(value, arg2 -> key)
+          THEN audit.jsonb_minus(value, arg2 -> key)
           -- for all the other types, we just return the value
           ELSE value
         END
@@ -76,22 +68,10 @@ AS $$
   FROM
     jsonb_each(arg1)
   WHERE
-    arg1 -> key <> arg2 -> key
+    arg1 -> key != arg2 -> key
     OR arg2 -> key IS NULL
+$function$ LANGUAGE SQL;
 
-$$ LANGUAGE SQL;
-
-DROP OPERATOR IF EXISTS - (jsonb, jsonb);
-CREATE OPERATOR - (
-  LEFTARG = jsonb,
-  RIGHTARG = jsonb,
-  PROCEDURE = jsonb_minus
-);
-
-
-CREATE SCHEMA audit;
-REVOKE ALL ON SCHEMA audit FROM public;
-COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
 
 --
 -- Audited data. Lots of information is available, it's just a matter of how
@@ -213,8 +193,8 @@ BEGIN
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_old - excluded_cols;
-        audit_row.diff = (jsonb_new - audit_row.original) - excluded_cols;
+        audit_row.original = audit.jsonb_minus(jsonb_old, excluded_cols);
+        audit_row.diff = audit.jsonb_minus(audit.jsonb_minus(jsonb_new, audit_row.original), excluded_cols);
         IF audit_row.diff = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
@@ -224,13 +204,13 @@ BEGIN
         IF jsonb_old ? row_key_col THEN
             audit_row.row_key = jsonb_old ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_old - excluded_cols;
+        audit_row.original = audit.jsonb_minus(jsonb_old, excluded_cols);
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         jsonb_new = to_jsonb(NEW.*);
         IF jsonb_new ? row_key_col THEN
             audit_row.row_key = jsonb_new ->> row_key_col;
         END IF;
-        audit_row.original = jsonb_new - excluded_cols;
+        audit_row.original = audit.jsonb_minus(jsonb_new, excluded_cols);
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
