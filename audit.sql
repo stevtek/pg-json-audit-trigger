@@ -1,6 +1,7 @@
 --
 -- Forked from
 --    https://github.com/tekells-usgs/pg-json-audit-trigger
+--    see also: https://github.com/elfotec/evo-pg-json-audit-trigger/
 --
 -- An audit history is important on most tables. Provide an audit trigger that logs to
 -- a dedicated audit table for the major relations.
